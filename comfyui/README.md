@@ -52,6 +52,26 @@ run **Claude Code locally on the PC**. Nothing needs to be exposed to the intern
 > `/internal/folder_paths` and `%APPDATA%/ComfyUI/config.json`, and update the "Paths on this PC" table in the skill.
 > Then run one t2i and one i2v test. Do NOT download any models; use only what's installed.
 
+## n8n automation (optional)
+
+`comfyui/n8n/comfyui_flux2_wan22.json` is an importable n8n workflow. It runs the same pipelines as `comfy_client.py`:
+
+**Generate form** → Config → `GET /object_info` (model discovery) → build Flux 2 workflow → `POST /prompt` → poll
+`/history` every 5 s → *Video wanted?* → build WAN 2.2 workflow (feeds the still in via `LoadImage "name.png [output]"`)
+→ `POST /prompt` → poll every 10 s → result (filenames in ComfyUI's output folder).
+
+1. In n8n, go to **Workflows → Import from File** and select `comfyui_flux2_wan22.json`.
+2. Open the **Config** node and set `comfyUrl`:
+   - `http://127.0.0.1:8000` for ComfyUI Desktop
+   - `:8188` for a manual install
+   - `http://host.docker.internal:8000` if n8n runs in Docker
+3. Click **Test workflow** (or activate the workflow). Then open the form URL shown on the **Generate form** node and fill in the prompt, mode and aspect.
+
+The form answers straight away and the job carries on in the background. Progress and any errors show under
+**Executions**. If a required model isn't installed, the build step stops with a clear error. Nothing is downloaded.
+Timeouts are 15 min for the image and 60 min for the video.
+To change a Code node, edit `comfyui/n8n/build_n8n_workflow.py` and run it to regenerate the JSON.
+
 ## Notes
 
 - **fps:** WAN 2.2 videos are saved at 16 fps (the model's native rate). The original skill's 24 fps default would play motion 1.5× too fast.

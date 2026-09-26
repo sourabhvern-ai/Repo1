@@ -1,0 +1,664 @@
+{
+  "name": "ComfyUI - Flux 2 Dev image + WAN 2.2 video",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "ComfyUI: Flux 2 Dev + WAN 2.2",
+        "formDescription": "Generates an image with Flux 2 Dev and, optionally, animates it with WAN 2.2 i2v. Results are saved in ComfyUI's output folder. Uses installed models only.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Prompt",
+              "fieldType": "textarea",
+              "requiredField": true,
+              "placeholder": "a steel arch bridge over a river at dawn, photorealistic"
+            },
+            {
+              "fieldLabel": "Mode",
+              "fieldType": "dropdown",
+              "requiredField": true,
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Image only"
+                  },
+                  {
+                    "option": "Image + video"
+                  }
+                ]
+              }
+            },
+            {
+              "fieldLabel": "Aspect",
+              "fieldType": "dropdown",
+              "requiredField": true,
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Landscape (1344x768 / video 832x480)"
+                  },
+                  {
+                    "option": "Portrait (768x1344 / video 480x832)"
+                  },
+                  {
+                    "option": "Square (1024x1024 / video 640x640)"
+                  }
+                ]
+              }
+            },
+            {
+              "fieldLabel": "Motion prompt",
+              "fieldType": "textarea",
+              "placeholder": "video only: e.g. slow aerial drift forward, mist moving over the water"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "c0e16459-207e-5483-bc04-30fe5a1adf8b",
+      "name": "Generate form",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "091da0fa-96b8-5fdc-9f00-52d8ac23bf1a"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "1ed340df-9208-582d-a935-877a4e6c5bac",
+              "name": "comfyUrl",
+              "value": "http://127.0.0.1:8000",
+              "type": "string"
+            },
+            {
+              "id": "bf2a29d4-2d70-5507-9ae6-c9a95c85114d",
+              "name": "fluxWeightDtype",
+              "value": "default",
+              "type": "string"
+            },
+            {
+              "id": "4082d995-b9b8-5a24-873f-85c608cdce85",
+              "name": "useSpeedLoras",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "2b52698d-559d-5090-9be8-2bf319076851",
+              "name": "videoSeconds",
+              "value": 5,
+              "type": "number"
+            },
+            {
+              "id": "0a6d9d81-134e-5570-8a65-0b1008dab858",
+              "name": "videoFps",
+              "value": 16,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "1c2c9c0d-2b2b-5dfa-8fba-de8ffb5393e4",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        220,
+        300
+      ],
+      "notesInFlow": true,
+      "notes": "comfyUrl: ComfyUI Desktop = :8000, manual install = :8188. If n8n runs in Docker use http://host.docker.internal:8000. fluxWeightDtype: fp8_e4m3fn for the full bf16 flux2-dev on <48 GB VRAM."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Config').first().json.comfyUrl }}/object_info",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "83ebfecb-4c29-5bcf-ac14-d63f6d03bab5",
+      "name": "Get object_info",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        300
+      ],
+      "notesInFlow": true,
+      "notes": "discovers installed models"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Dropdown options from /object_info (legacy [[...], {}] or wrapped [\"COMBO\", {options}])\nfunction options(oi, node, input) {\n  const spec = oi?.[node]?.input?.required?.[input];\n  if (!spec) return [];\n  if (Array.isArray(spec[0])) return spec[0];\n  if (spec[0] === 'COMBO' && spec[1]) return spec[1].options || [];\n  return [];\n}\n// First file containing every `must` token, ranked by `prefer`, excluding `avoid`\nfunction pick(names, must, prefer = [], avoid = []) {\n  const low = s => s.toLowerCase().replace(/\\\\/g, '/');\n  const hits = names.filter(n => must.every(t => low(n).includes(t)) && !avoid.some(t => low(n).includes(t)));\n  hits.sort((a, b) => (prefer.filter(t => low(b).includes(t)).length - prefer.filter(t => low(a).includes(t)).length) || a.length - b.length);\n  return hits[0] || null;\n}\nfunction slugify(t) {\n  return (t.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40).replace(/-+$/, '')) || 'untitled';\n}\n\nconst oi = $input.first().json;\nconst cfg = $('Config').first().json;\nconst form = $('Generate form').first().json;\n\nconst unets = options(oi, 'UNETLoader', 'unet_name');\nconst clips = options(oi, 'CLIPLoader', 'clip_name');\nconst vaes  = options(oi, 'VAELoader', 'vae_name');\nconst loras = options(oi, 'LoraLoaderModelOnly', 'lora_name');\n\nconst flux = {\n  unet: pick(unets, ['flux2'], ['dev'], ['klein']) || pick(unets, ['flux.2'], [], ['klein']),\n  te:   pick(clips, ['mistral'], ['flux2']),\n  vae:  pick(vaes, ['flux2']) || pick(vaes, ['full_encoder_small_decoder']),\n  turbo: cfg.useSpeedLoras ? pick(loras, ['flux', '2', 'turbo']) : null,\n};\nconst wan = {\n  high: pick(unets, ['wan2.2', 'i2v', 'high']),\n  low:  pick(unets, ['wan2.2', 'i2v', 'low']),\n  te:   pick(clips, ['umt5'], ['fp8', 'scaled']),\n  vae:  pick(vaes, ['wan_2.1_vae']) || pick(vaes, ['wan2.1', 'vae']),\n  loraHigh: cfg.useSpeedLoras ? pick(loras, ['i2v', 'lightx2v', 'high']) : null,\n  loraLow:  cfg.useSpeedLoras ? pick(loras, ['i2v', 'lightx2v', 'low']) : null,\n};\n\nconst wantVideo = form['Mode'] === 'Image + video';\nconst missing = Object.entries({ 'Flux 2 UNet': flux.unet, 'Flux 2 text encoder (mistral)': flux.te, 'Flux 2 VAE': flux.vae })\n  .concat(wantVideo ? Object.entries({ 'WAN 2.2 i2v high-noise': wan.high, 'WAN 2.2 i2v low-noise': wan.low,\n                                       'WAN text encoder (umt5)': wan.te, 'WAN 2.1 VAE': wan.vae }) : [])\n  .filter(([, v]) => !v).map(([k]) => k);\nif (missing.length) {\n  throw new Error('Not installed in ComfyUI (this workflow never downloads models): ' + missing.join(', '));\n}\nif (!options(oi, 'CLIPLoader', 'type').includes('flux2') || !oi['Flux2Scheduler']) {\n  throw new Error('This ComfyUI build has no Flux 2 support. Update ComfyUI Desktop.');\n}\n\n// Image / video sizes per aspect choice (multiples of 16)\nconst sizes = {\n  'Landscape': { img: [1344, 768], vid: [832, 480] },\n  'Portrait':  { img: [768, 1344], vid: [480, 832] },\n  'Square':    { img: [1024, 1024], vid: [640, 640] },\n};\nconst size = sizes[(form['Aspect'] || 'Landscape').split(' ')[0]] || sizes['Landscape'];\nconst [W, H] = size.img;\nconst seed = Math.floor(Math.random() * 2 ** 48);\nconst date = new Date().toISOString().slice(0, 10).replace(/-/g, '');\nconst prefix = `${date}_${slugify(form['Prompt'])}`;\n\nconst wf = {\n  '1':  { class_type: 'UNETLoader', inputs: { unet_name: flux.unet, weight_dtype: cfg.fluxWeightDtype } },\n  '2':  { class_type: 'CLIPLoader', inputs: { clip_name: flux.te, type: 'flux2', device: 'default' } },\n  '3':  { class_type: 'VAELoader', inputs: { vae_name: flux.vae } },\n  '4':  { class_type: 'CLIPTextEncode', inputs: { text: form['Prompt'], clip: ['2', 0] } },\n  '5':  { class_type: 'FluxGuidance', inputs: { guidance: 4.0, conditioning: ['4', 0] } },\n  '6':  { class_type: 'BasicGuider', inputs: { model: ['1', 0], conditioning: ['5', 0] } },\n  '7':  { class_type: 'RandomNoise', inputs: { noise_seed: seed } },\n  '8':  { class_type: 'KSamplerSelect', inputs: { sampler_name: 'euler' } },\n  '9':  { class_type: 'Flux2Scheduler', inputs: { steps: flux.turbo ? 8 : 20, width: W, height: H } },\n  '10': { class_type: 'EmptyFlux2LatentImage', inputs: { width: W, height: H, batch_size: 1 } },\n  '11': { class_type: 'SamplerCustomAdvanced', inputs: { noise: ['7', 0], guider: ['6', 0], sampler: ['8', 0], sigmas: ['9', 0], latent_image: ['10', 0] } },\n  '12': { class_type: 'VAEDecode', inputs: { samples: ['11', 0], vae: ['3', 0] } },\n  '13': { class_type: 'SaveImage', inputs: { filename_prefix: prefix, images: ['12', 0] } },\n};\nif (flux.turbo) {\n  wf['14'] = { class_type: 'LoraLoaderModelOnly', inputs: { model: ['1', 0], lora_name: flux.turbo, strength_model: 1.0 } };\n  wf['6'].inputs.model = ['14', 0];\n}\n\nreturn [{ json: { fluxWorkflow: wf, flux, wan, wantVideo, videoSize: size.vid, seed, prefix } }];\n"
+      },
+      "id": "ae587f91-938c-5212-ac50-fe410626637d",
+      "name": "Build Flux 2 workflow",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.comfyUrl }}/prompt",
+        "options": {
+          "timeout": 120000
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ prompt: $json.fluxWorkflow }) }}"
+      },
+      "id": "1f1cce89-ee86-559e-a99c-ab93b8fa7e61",
+      "name": "Submit Flux 2",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "amount": 5,
+        "unit": "seconds"
+      },
+      "id": "fc769aae-14b4-5dc0-8dfa-18f871913ee8",
+      "name": "Wait (image)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1100,
+        300
+      ],
+      "webhookId": "d128c4d5-16ad-5b34-9690-bf09ab204f7f"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Config').first().json.comfyUrl }}/history/{{ $('Submit Flux 2').first().json.prompt_id }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "1e2f815c-532b-5824-b433-963023f07178",
+      "name": "Get Flux 2 history",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1320,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Poll result: {} while queued/running, {<id>: {...}} once finished\nconst pid = $('Submit Flux 2').first().json.prompt_id;\nconst entry = $input.first().json[pid];\nif (!entry) {\n  if ($runIndex >= 180) throw new Error('Flux 2 job ' + pid + ' timed out. Check the ComfyUI queue.');\n  return [{ json: { done: false } }];\n}\nconst status = entry.status || {};\nif (status.status_str === 'error') {\n  const err = (status.messages || []).filter(m => m[0] === 'execution_error').map(m => m[1]);\n  throw new Error('Flux 2 job failed: ' + JSON.stringify(err).slice(0, 2000));\n}\nconst files = [];\nfor (const out of Object.values(entry.outputs || {})) {\n  for (const key of ['images', 'videos', 'gifs', 'files']) {\n    for (const f of out[key] || []) if (f && f.filename) files.push({ filename: f.filename, subfolder: f.subfolder || '', type: f.type || 'output' });\n  }\n}\nreturn [{ json: { done: true, prompt_id: pid, files } }];\n"
+      },
+      "id": "6bb4fe36-1135-5025-9843-fa4e0095971e",
+      "name": "Check Flux 2 status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "3c489aa5-1814-5ac7-b4cc-a0a3a64a32c7",
+              "leftValue": "={{ $json.done }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5ed1a93a-c9b4-5367-ac47-22e15b72431c",
+      "name": "Image done?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1760,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b371cb85-5788-55bb-a435-52c37a697cbb",
+              "leftValue": "={{ $('Build Flux 2 workflow').first().json.wantVideo }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "667715fd-e0e1-5264-9012-ee1fd4250568",
+      "name": "Video wanted?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1980,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "79c42a3c-f836-5996-b564-716ac363f76b",
+              "name": "image",
+              "value": "={{ $('Check Flux 2 status').last().json.files.map(f => (f.subfolder ? f.subfolder + '/' : '') + f.filename).join(', ') }}",
+              "type": "string"
+            },
+            {
+              "id": "0afe528b-cbed-5383-acae-d74e484c328e",
+              "name": "savedIn",
+              "value": "ComfyUI output folder",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "b18c973a-bb41-582e-a197-b5694f081924",
+      "name": "Image result",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2200,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const job = $('Build Flux 2 workflow').first().json;\nconst cfg = $('Config').first().json;\nconst form = $('Generate form').first().json;\nconst img = $input.first().json.files[0];\nif (!img) throw new Error('Flux 2 job finished but saved no image.');\n\n// LoadImage can read straight from the output folder with the \" [output]\" suffix\nconst imageRef = `${img.subfolder ? img.subfolder + '/' : ''}${img.filename} [output]`;\nconst m = job.wan;\nconst lightning = !!(m.loraHigh && m.loraLow);\nconst [steps, cfgScale, split] = lightning ? [4, 1.0, 2] : [20, 3.5, 10];\nconst fps = Number(cfg.videoFps);\nconst length = Math.floor(Number(cfg.videoSeconds) * fps / 4) * 4 + 1;   // WAN needs 4k+1 frames\nconst [W, H] = job.videoSize;\nconst negative = '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走';\n\nconst wf = {\n  '1':  { class_type: 'UNETLoader', inputs: { unet_name: m.high, weight_dtype: 'default' } },\n  '2':  { class_type: 'UNETLoader', inputs: { unet_name: m.low, weight_dtype: 'default' } },\n  '3':  { class_type: 'CLIPLoader', inputs: { clip_name: m.te, type: 'wan', device: 'default' } },\n  '4':  { class_type: 'VAELoader', inputs: { vae_name: m.vae } },\n  '5':  { class_type: 'LoadImage', inputs: { image: imageRef } },\n  '6':  { class_type: 'CLIPTextEncode', inputs: { text: form['Motion prompt'] || form['Prompt'], clip: ['3', 0] } },\n  '7':  { class_type: 'CLIPTextEncode', inputs: { text: negative, clip: ['3', 0] } },\n  '8':  { class_type: 'ModelSamplingSD3', inputs: { model: ['1', 0], shift: 5.0 } },\n  '9':  { class_type: 'ModelSamplingSD3', inputs: { model: ['2', 0], shift: 5.0 } },\n  '10': { class_type: 'WanImageToVideo', inputs: { positive: ['6', 0], negative: ['7', 0], vae: ['4', 0], start_image: ['5', 0],\n                                                   width: W, height: H, length, batch_size: 1 } },\n  '11': { class_type: 'KSamplerAdvanced', inputs: { add_noise: 'enable', noise_seed: job.seed, steps, cfg: cfgScale,\n          sampler_name: 'euler', scheduler: 'simple', start_at_step: 0, end_at_step: split, return_with_leftover_noise: 'enable',\n          model: ['8', 0], positive: ['10', 0], negative: ['10', 1], latent_image: ['10', 2] } },\n  '12': { class_type: 'KSamplerAdvanced', inputs: { add_noise: 'disable', noise_seed: 0, steps, cfg: cfgScale,\n          sampler_name: 'euler', scheduler: 'simple', start_at_step: split, end_at_step: 10000, return_with_leftover_noise: 'disable',\n          model: ['9', 0], positive: ['10', 0], negative: ['10', 1], latent_image: ['11', 0] } },\n  '13': { class_type: 'VAEDecode', inputs: { samples: ['12', 0], vae: ['4', 0] } },\n  '14': { class_type: 'CreateVideo', inputs: { images: ['13', 0], fps } },\n  // \"auto\"/\"auto\" = mp4 + h264; valid on both the old flat and the new nested SaveVideo schema\n  '15': { class_type: 'SaveVideo', inputs: { video: ['14', 0], filename_prefix: 'video/' + job.prefix, format: 'auto', codec: 'auto' } },\n};\nif (lightning) {\n  wf['16'] = { class_type: 'LoraLoaderModelOnly', inputs: { model: ['1', 0], lora_name: m.loraHigh, strength_model: 1.0 } };\n  wf['17'] = { class_type: 'LoraLoaderModelOnly', inputs: { model: ['2', 0], lora_name: m.loraLow, strength_model: 1.0 } };\n  wf['8'].inputs.model = ['16', 0];\n  wf['9'].inputs.model = ['17', 0];\n}\nreturn [{ json: { wanWorkflow: wf, image: imageRef, frames: length, fps, lightning } }];\n"
+      },
+      "id": "0779e5a5-c5a0-571a-a8e6-55c0bda3f835",
+      "name": "Build WAN 2.2 workflow",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2200,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.comfyUrl }}/prompt",
+        "options": {
+          "timeout": 120000
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ prompt: $json.wanWorkflow }) }}"
+      },
+      "id": "02322be1-0399-5628-a465-31347045a555",
+      "name": "Submit WAN 2.2",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2420,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "amount": 10,
+        "unit": "seconds"
+      },
+      "id": "dd8418f3-7a1b-56b4-823a-97fc90cd89ca",
+      "name": "Wait (video)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2640,
+        100
+      ],
+      "webhookId": "35301ea2-183d-51f0-948b-782b65810663"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Config').first().json.comfyUrl }}/history/{{ $('Submit WAN 2.2').first().json.prompt_id }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "2d1a061f-1534-50b2-bd7f-d150bb377ce5",
+      "name": "Get WAN 2.2 history",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2860,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Poll result: {} while queued/running, {<id>: {...}} once finished\nconst pid = $('Submit WAN 2.2').first().json.prompt_id;\nconst entry = $input.first().json[pid];\nif (!entry) {\n  if ($runIndex >= 360) throw new Error('WAN 2.2 job ' + pid + ' timed out. Check the ComfyUI queue.');\n  return [{ json: { done: false } }];\n}\nconst status = entry.status || {};\nif (status.status_str === 'error') {\n  const err = (status.messages || []).filter(m => m[0] === 'execution_error').map(m => m[1]);\n  throw new Error('WAN 2.2 job failed: ' + JSON.stringify(err).slice(0, 2000));\n}\nconst files = [];\nfor (const out of Object.values(entry.outputs || {})) {\n  for (const key of ['images', 'videos', 'gifs', 'files']) {\n    for (const f of out[key] || []) if (f && f.filename) files.push({ filename: f.filename, subfolder: f.subfolder || '', type: f.type || 'output' });\n  }\n}\nreturn [{ json: { done: true, prompt_id: pid, files } }];\n"
+      },
+      "id": "0212ecf7-e7f8-5c22-acc4-44f5b75a262d",
+      "name": "Check WAN 2.2 status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3080,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "576698a1-9d0e-52d5-b2c4-f8dc7a6f78b6",
+              "leftValue": "={{ $json.done }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d98cc817-57d2-53f5-b3b1-2f42ab5e0e1c",
+      "name": "Video done?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3300,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "feb71868-7a77-5d73-9d07-86ccac0c8e43",
+              "name": "image",
+              "value": "={{ $('Build WAN 2.2 workflow').first().json.image }}",
+              "type": "string"
+            },
+            {
+              "id": "514d01f5-4df8-59f2-9bcb-befb8f4a7657",
+              "name": "video",
+              "value": "={{ $json.files.map(f => (f.subfolder ? f.subfolder + '/' : '') + f.filename).join(', ') }}",
+              "type": "string"
+            },
+            {
+              "id": "cf984d0e-e953-5cbc-bf22-00b82bf59f6f",
+              "name": "savedIn",
+              "value": "ComfyUI output folder",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "5ffa0afe-32c7-5466-bf25-a1427cb32523",
+      "name": "Video result",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        3520,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Generate form": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Get object_info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get object_info": {
+      "main": [
+        [
+          {
+            "node": "Build Flux 2 workflow",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Flux 2 workflow": {
+      "main": [
+        [
+          {
+            "node": "Submit Flux 2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Submit Flux 2": {
+      "main": [
+        [
+          {
+            "node": "Wait (image)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait (image)": {
+      "main": [
+        [
+          {
+            "node": "Get Flux 2 history",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Flux 2 history": {
+      "main": [
+        [
+          {
+            "node": "Check Flux 2 status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Flux 2 status": {
+      "main": [
+        [
+          {
+            "node": "Image done?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build WAN 2.2 workflow": {
+      "main": [
+        [
+          {
+            "node": "Submit WAN 2.2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Submit WAN 2.2": {
+      "main": [
+        [
+          {
+            "node": "Wait (video)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait (video)": {
+      "main": [
+        [
+          {
+            "node": "Get WAN 2.2 history",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get WAN 2.2 history": {
+      "main": [
+        [
+          {
+            "node": "Check WAN 2.2 status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check WAN 2.2 status": {
+      "main": [
+        [
+          {
+            "node": "Video done?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Image done?": {
+      "main": [
+        [
+          {
+            "node": "Video wanted?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait (image)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Video wanted?": {
+      "main": [
+        [
+          {
+            "node": "Build WAN 2.2 workflow",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Image result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Video done?": {
+      "main": [
+        [
+          {
+            "node": "Video result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait (video)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}
