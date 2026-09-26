@@ -1,0 +1,8 @@
+comfyui/projects/
+__pycache__/
+*.pyc
+.env
+*_workflow-api.json
+
+# Per-developer Claude Code settings (may contain approved local commands). Never commit.
+.claude/settings.local.json
